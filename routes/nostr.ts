@@ -395,7 +395,7 @@ export default {
         profile: pubkey,
         event: id,
         amount: amount * 1000,
-        relays: ["wss://relay.coinos.io", "wss://relay.primal.net"],
+        relays: ["wss://relay.satsroute.com", "wss://relay.primal.net"],
         comment: "",
       });
 

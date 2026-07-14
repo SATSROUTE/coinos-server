@@ -35,7 +35,7 @@ export const mail = async (user, subject, template, params) => {
           },
           Subject: { Charset, Data: subject },
         },
-        Source: `"Coinos " <${config.support}>`,
+        Source: `"SatsRoute " <${config.support}>`,
       }),
     );
   } catch (e) {

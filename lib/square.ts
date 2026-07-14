@@ -47,9 +47,9 @@ export const squarePayment = async (p, user) => {
         }
       : undefined,
     autocomplete: true,
-    externalDetails: { type: "OTHER", source: `Coinos payment ${p.id}` },
+    externalDetails: { type: "OTHER", source: `SatsRoute payment ${p.id}` },
     locationId: locs.locations[0].id,
     referenceId: v4(),
-    note: `Coinos payment ${p.id}`,
+    note: `SatsRoute payment ${p.id}`,
   });
 };

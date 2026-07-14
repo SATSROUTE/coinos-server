@@ -40,7 +40,7 @@ export default {
   // closed). Set a strong, unique value only if you need admin impersonation;
   // never ship the sample value.
   adminpass: "",
-  support: "support@coinos.io",
+  support: "suporte@satsroute.com",
   // SECURITY: generate fresh keys — never deploy these sample values. These are
   // the server NWC wallet-service key and the zap-receipt signer.
   //   node -e "import('nostr-tools').then(n=>console.log(n.nip19.nsecEncode(n.generateSecretKey())))"

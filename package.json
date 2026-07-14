@@ -1,5 +1,5 @@
 {
-  "name": "coinos",
+  "name": "satsroute",
   "version": "0.0.1",
   "private": true,
   "patchedDependencies": {
@@ -63,8 +63,8 @@
     "typescript": "^5.9.3"
   },
   "apidoc": {
-    "title": "CoinOS Server API Documentation",
-    "url": "https://coinos.io/api"
+    "title": "SatsRoute Server API Documentation",
+    "url": "https://satsroute.com/api"
   },
   "type": "module",
   "overrides": {

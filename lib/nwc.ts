@@ -543,7 +543,7 @@ const checkBudget = async (app, amount) => {
     return {
       budgetError: error({
         code: "UNAUTHORIZED",
-        message: `This NWC connection is no longer valid please create a new one at https://coinos.io/settings/nostr`,
+        message: `This NWC connection is no longer valid please create a new one at https://satsroute.com/settings/nostr`,
       }),
       remaining: 0,
     };
