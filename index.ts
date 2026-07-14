@@ -145,7 +145,8 @@ app.post(
       rateLimit: {
         max: 5,
         timeWindow: "5 seconds",
-        keyGenerator: (req) => req.headers["cf-connecting-ip"] as string, // IP-based rate limiting
+        keyGenerator: (req) =>
+          (req.headers["cf-connecting-ip"] as string) || req.ip, // IP-based; fallback p/ req.ip (com trustProxy) quando sem Cloudflare
       },
     },
   },
@@ -208,6 +209,10 @@ const port: number = Number.parseInt(process.env["PORT"]) || 3119;
 
 app.listen({ host, port });
 
-const logerr = (e: Error) => {};
+const logerr = (e: Error) => {
+  try {
+    app.log.error(e);
+  } catch {}
+};
 process.on("unhandledRejection", logerr);
 process.on("uncaughtException", logerr);

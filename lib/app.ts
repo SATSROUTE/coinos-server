@@ -17,6 +17,9 @@ const app = fastify({
   logger: true,
   logController: new fastify.LogController({ disableRequestLogging: true }),
   routerOptions: { maxParamLength: 500 },
+  // Atras do Caddy: confia no proxy para que req.ip reflita o IP real do cliente
+  // (X-Forwarded-For). Sem isto, todos os IPs colapsam no IP do proxy.
+  trustProxy: true,
 });
 
 const reqLogger = pino(pino.destination("req"));
