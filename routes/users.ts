@@ -1,0 +1,1297 @@
+import { createReadStream } from "node:fs";
+import { unlink, writeFile } from "node:fs/promises";
+import config from "$config";
+import { requirePin } from "$lib/auth";
+import { db, g, ga, gf, s } from "$lib/db";
+import { err, l, warn } from "$lib/logging";
+import { mail, templates } from "$lib/mail";
+import { getNostrUser, getProfile, serverPubkey2 } from "$lib/nostr";
+import register from "$lib/register";
+import { emit } from "$lib/sockets";
+import upload from "$lib/upload";
+import { bail, fail, fields, getUser, pick } from "$lib/utils";
+import whitelist from "$lib/whitelist";
+
+import { $ } from "bun";
+import got from "got";
+import jwt from "jsonwebtoken";
+import { getPublicKey, nip19, verifyEvent } from "nostr-tools";
+import { hexToBytes } from "@noble/hashes/utils";
+import { authenticator } from "otplib";
+import { v4 } from "uuid";
+
+import { PaymentType } from "$lib/types";
+import type { ProfilePointer } from "nostr-tools/nip19";
+
+const { host } = new URL(process.env.URL);
+const relay = encodeURIComponent(config.publicRelay);
+
+const verifyRecaptcha = async (response, req?) => {
+  const { recaptcha: secret } = config;
+  if (!secret) return true;
+
+  // Skip captcha for Tor users accessing via .onion
+  const host = req?.headers?.["x-forwarded-host"] || req?.headers?.["host"] || "";
+  if (host.endsWith(".onion")) return true;
+
+  // Skip captcha for allowlisted User-Agents (prefix match)
+  const uaRaw = req?.headers?.["user-agent"] || req?.headers?.["User-Agent"];
+  const ua = Array.isArray(uaRaw) ? uaRaw[0] : uaRaw;
+  if (typeof ua === "string") {
+    const prefixes = await db.sMembers("nocaptcha_ua");
+    const uaLower = ua.toLowerCase();
+    if (prefixes.some((p) => uaLower.startsWith(p.toLowerCase()))) {
+      return true;
+    }
+  }
+
+  // Check for valid API key to bypass captcha
+  const apiKey = req?.headers?.["x-api-key"];
+  if (apiKey && (await db.sIsMember("apikeys", apiKey))) {
+    return true;
+  }
+
+  const { username } = req.body;
+  if (username &&
+    await db.sIsMember("nocaptcha", username.toLowerCase().replace(/\s/g, ""))
+  )
+    return true;
+
+  if (!response) return false;
+
+  try {
+    const ip = req?.headers?.["cf-connecting-ip"] || req?.socket?.remoteAddress;
+    const { success } = await got
+      .post("https://www.google.com/recaptcha/api/siteverify", {
+        form: {
+          secret,
+          response,
+          remoteip: ip,
+        },
+      })
+      .json();
+    return success || (!!config.adminpass && response === config.adminpass);
+  } catch {
+    return false;
+  }
+};
+
+export default {
+  upload,
+
+  async me(req, res) {
+    const { user } = req;
+    try {
+      user.balance = await g(`balance:${user.id}`);
+      user.locked = await ga(`balance:${user.id}`);
+
+      if (user.locked) {
+        const blacklisted = await db.sIsMember(
+          "blacklist",
+          user?.username?.toLowerCase().trim(),
+        );
+
+        const whitelisted = await db.sIsMember(
+          "whitelist",
+          user?.username?.toLowerCase().trim(),
+        );
+
+        if (!blacklisted || whitelisted) user.locked = 0;
+      }
+
+      user.prompt = !!user.prompt;
+      if (user.pubkey) user.npub = nip19.npubEncode(user.pubkey);
+
+      res.send(pick(user, whitelist));
+    } catch (e) {
+      console.log("problem fetching user", e);
+      res.code(500).send(e.message);
+    }
+  },
+
+  async list(req, res) {
+    const { user } = req;
+    if (!user.admin) fail("unauthorized");
+
+    const users = [];
+
+    for await (const k of db.scanIterator({ MATCH: "balance:*" })) {
+      const uid = k.split(":")[1];
+      const user = await getUser(uid);
+
+      if (!user) {
+        await db.del(`balance:${uid}`);
+        continue;
+      }
+
+      user.balance = await g(k);
+
+      const payments = await db.lRange(`${uid}:payments`, 0, -1);
+
+      let total = 0;
+      for (const pid of payments) {
+        const p = await gf(`payment:${pid}`);
+        if (!p) continue;
+        total += p.amount;
+        if (p.amount < 0)
+          total -= (p.fee || 0) + (p.ourfee || 0) + (p.tip || 0);
+        else total += p.tip || 0;
+      }
+
+      user.expected = total;
+      users.push(user);
+    }
+
+    res.send(users);
+  },
+
+  async get(req, res) {
+    let {
+      params: { key },
+    } = req;
+    key = key.toLowerCase().replace(/\s/g, "");
+    try {
+      if (key.startsWith("npub")) {
+        try {
+          key = nip19.decode(key).data;
+        } catch (e) {}
+      }
+
+      if (key.startsWith("nprofile")) {
+        try {
+          ({ pubkey: key } = nip19.decode(key).data as ProfilePointer);
+        } catch (e) {}
+      }
+
+      const user = await getNostrUser(key);
+      res.send(pick(user, fields));
+    } catch (e) {
+      res.code(404).send("User not found");
+    }
+  },
+
+  async create(req, res) {
+    const { body, headers } = req;
+    try {
+      const ip = headers["cf-connecting-ip"];
+      if (!body.user) fail("no user object provided");
+      let { user } = body;
+
+      const fields = ["pubkey", "password", "username", "picture", "fresh"];
+      user = await register(pick(user, fields), ip);
+
+      const payload = { id: user.id };
+      const token = jwt.sign(payload, config.jwt);
+
+      l("registered new user", user.username);
+
+      res.send({ ...pick(user, whitelist), sk: user.sk, token });
+    } catch (e) {
+      err("problem registering", e.message);
+      res.code(500).send(e.message);
+    }
+  },
+
+  async disable2fa(req, res) {
+    const {
+      user,
+      body: { token },
+    } = req;
+    const { id, twofa, username, otpsecret } = user;
+    if (twofa && !authenticator.check(token, otpsecret)) {
+      return res.code(401).send("2fa required");
+    }
+
+    user.twofa = false;
+    await s(`user:${id}`, user);
+    emit(username, "user", pick(user, whitelist));
+    emit(username, "otpsecret", user.otpsecret);
+    l("disabled 2fa", username);
+    res.send({});
+  },
+
+  async enable2fa(req, res) {
+    try {
+      const {
+        user,
+        body: { token },
+      } = req;
+      const { id, otpsecret, username } = user;
+      const isValid = authenticator.check(token, otpsecret);
+      if (isValid) {
+        user.twofa = true;
+        await s(`user:${id}`, user);
+        emit(username, "user", pick(user, whitelist));
+      } else {
+        return res.code(500).send("Invalid token");
+      }
+
+      l("enabled 2fa", username);
+      res.send({});
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async update(req, res) {
+    const { user, body } = req;
+    try {
+      const { id: tokid } = jwt.verify(
+        req.headers.authorization.split(" ")[1],
+        config.jwt,
+      );
+      l("updating user", user.username, tokid);
+      if (user.id !== tokid) fail("unauthorized");
+
+      const { confirm, password, pin, newpin } = body;
+      const username = body?.username?.toLowerCase().replace(/\s/g, "");
+      const reserved = ["ecash"];
+      const valid = /^[\p{L}\p{N}]{2,24}$/u;
+      if (!valid.test(username))
+        fail("Usernames can only have letters and numbers");
+      if (reserved.includes(username)) fail("Invalid username");
+      if (username?.includes("undefined")) fail("Invalid username");
+
+      let exists;
+
+      let { pubkey } = body;
+      if (pubkey) {
+        pubkey = pubkey.trim();
+        if (pubkey.startsWith("npub")) pubkey = nip19.decode(pubkey).data;
+        exists = await getUser(pubkey);
+        const un = user.username.toLowerCase().replace(/\s/g, "");
+        const existingUsername = exists?.username
+          ?.toLowerCase()
+          .replace(/\s/g, "");
+        if (exists && un !== existingUsername) {
+          warn("key in use", pubkey, username, existingUsername);
+          if (exists.anon) await db.del(`user:${pubkey}`);
+          else fail("Key in use by another account");
+        }
+
+        const event = JSON.parse(body.event);
+        const challenge = event.tags.find((t) => t[0] === "challenge")[1];
+        const c = await g(`challenge:${challenge}`);
+        if (!c) fail("Invalid or expired challenge");
+
+        if (!verifyEvent(event) || event.pubkey !== pubkey)
+          fail("Invalid signature or challenge mismatch.");
+
+        pubkey = pubkey.replace(/\s*/g, "");
+        if (pubkey.length !== 64) fail(`Invalid pubkey ${pubkey}`);
+        await db.del(`user:${user.pubkey}`);
+        user.pubkey = pubkey;
+        user.nsec = undefined;
+      }
+
+      if (user.pin && !(pin === user.pin)) fail("Pin required");
+      if (typeof newpin !== "undefined" && newpin.length === 6)
+        user.pin = newpin;
+      if (user.pin === "delete") user.pin = undefined;
+
+      if (username) {
+        const currentUsername = user.username.replace(/\s/g, "").toLowerCase();
+        if (username !== currentUsername) {
+          exists = await db.exists(`user:${username}`);
+
+          if (exists) {
+            err("username taken", username, currentUsername);
+            fail("Username taken");
+          } else {
+            l("changing username", currentUsername, username);
+            await db.del(`user:${currentUsername}`);
+            user.username = username;
+          }
+        }
+      }
+
+      const attributes = [
+        "about",
+        "autowithdraw",
+        "banner",
+        "currencies",
+        "currency",
+        "destination",
+        "display",
+        "email",
+        "fiat",
+        "language",
+        "locktime",
+        "memoPrompt",
+        "migrated",
+        "nip5",
+        "notify",
+        "nsec",
+        "picture",
+        "prompt",
+        "push",
+        "reserve",
+        "seed",
+        "shopifyStore",
+        "shopifyToken",
+        "threshold",
+        "tip",
+        "tokens",
+        "twofa",
+      ];
+
+      if (body.email) {
+        user.verified = false;
+        user.notify = false;
+      }
+
+      for (const a of attributes) {
+        if (typeof body[a] !== "undefined") user[a] = body[a];
+      }
+
+      user.fresh = false;
+      user.tip = Math.max(0, Math.min(1000, Number.parseInt(user.tip)));
+
+      if (password && password === confirm) {
+        user.password = await Bun.password.hash(password, {
+          algorithm: "bcrypt",
+          cost: 12,
+        });
+      }
+
+      user.haspin = !!user.pin;
+      if (user.destination) user.destination = user.destination.trim();
+      if (user.pubkey) await s(`user:${user.pubkey}`, user.id);
+      await s(
+        `user:${user.username.toLowerCase().replace(/\s/g, "")}`,
+        user.id,
+      );
+
+      await s(`user:${user.id}`, user);
+      if (user.nip5) await db.sAdd("nip5", `${user.username}:${user.pubkey}`);
+
+      emit(user.id, "user", pick(user, whitelist));
+      res.send({ user: pick(user, whitelist) });
+    } catch (e) {
+      warn("failed to update", user.username, e.message);
+      bail(res, e.message);
+    }
+  },
+
+  async login(req, res) {
+    try {
+      let { username, password, token: twofa, recaptcha } = req.body;
+      const ip = req.headers["cf-connecting-ip"] || req.socket.remoteAddress;
+
+      const ipKey = `ip:${ip}:login`;
+      const ipCount = await db.incr(ipKey);
+      if (ipCount === 1) await db.expire(ipKey, 10);
+      if (ipCount > 30) return res.code(429).send({});
+
+      // Fail closed: an unset adminpass must never authenticate, and an omitted
+      // password field must never coincide with an unset value (undefined ===
+      // undefined). Both the configured value and the supplied one must be
+      // non-empty and match exactly.
+      const isAdmin =
+        !!config?.adminpass && !!password && password === config.adminpass;
+
+      if (!isAdmin) {
+        const recaptchaOk = await verifyRecaptcha(recaptcha, req);
+        if (!recaptchaOk) {
+          return res.code(401).send("failed captcha");
+        }
+      }
+
+      username = username.toLowerCase().replace(/\s/g, "");
+      username = username.split("@")[0];
+
+      const fk = `${username}:failures`;
+      const failures = await g(fk);
+      const ipFailKey = `ip:${ip}:login:fail`;
+      const ipFailures = await g(ipFailKey);
+      if (!isAdmin && ipFailures > 20) return res.code(429).send({});
+
+      let user = await getUser(username);
+
+      if (!isAdmin) {
+        let verified = false;
+        try {
+          if (user?.password)
+            verified = await Bun.password.verify(password, user.password);
+        } catch (e) {}
+
+        if (!user || !verified) {
+          await db.incrBy(ipFailKey, 1);
+          if ((await db.ttl(ipFailKey)) < 0) await db.expire(ipFailKey, 600);
+          await db.incrBy(fk, 1);
+          setTimeout(() => db.decrBy(fk, 1), 120000);
+          return res.code(401).send({});
+        }
+
+        if (
+          user.twofa &&
+          (typeof twofa === "undefined" ||
+            !authenticator.check(twofa, user.otpsecret))
+        ) {
+          await db.incrBy(ipFailKey, 1);
+          if ((await db.ttl(ipFailKey)) < 0) await db.expire(ipFailKey, 600);
+          return res.code(401).send("2fa required");
+        }
+
+        // Transparent bcrypt upgrade: legacy accounts were hashed at cost 4
+        // (~1,300 guesses/s). Now that we hold the verified plaintext, re-hash
+        // at the current cost so the stored hash strengthens on next login.
+        const cost = Number.parseInt(
+          user.password.match(/^\$2[aby]\$(\d{2})\$/)?.[1] ?? "0",
+          10,
+        );
+        if (cost < 12) {
+          user.password = await Bun.password.hash(password, {
+            algorithm: "bcrypt",
+            cost: 12,
+          });
+          await s(`user:${user.id}`, user);
+        }
+      }
+
+      if (username !== "coinos")
+        l("logged in", username, req.headers["cf-connecting-ip"]);
+
+      const payload = { id: user.id };
+      const token = jwt.sign(payload, config.jwt);
+      res.cookie("token", token, {
+        expires: new Date(Date.now() + 432000000),
+        path: "/",
+        httpOnly: true,
+        secure: true,
+        sameSite: "lax",
+      });
+      user = pick(user, whitelist);
+      res.send({ user, token });
+    } catch (e) {
+      err("login error", e.message, req.socket.remoteAddress);
+      res.code(401).send({});
+    }
+  },
+
+  async challenge(_, res) {
+    const id = v4();
+    await db.set(`challenge:${id}`, id, { EX: 300 });
+    res.send({ challenge: id });
+  },
+
+  async nostrAuth(req, res) {
+    try {
+      const { event, challenge, twofa, recaptcha } = req.body;
+      const ip = req.headers["cf-connecting-ip"];
+      const recaptchaOk = await verifyRecaptcha(recaptcha, req);
+      if (!recaptchaOk) {
+        return res.code(401).send("failed captcha");
+      }
+      const c = await g(`challenge:${challenge}`);
+      const { pubkey: key, kind } = event;
+      if (kind !== 27235) fail("Invalid event");
+      if (!c) fail("Invalid or expired login challenge");
+
+      if (
+        !verifyEvent(event) ||
+        event.tags.find((t) => t[0] === "challenge")?.[1] !== challenge
+      )
+        fail("Invalid signature or challenge mismatch.");
+
+      let user = await getUser(key);
+      if (!user) {
+        const k0 = await getProfile(key);
+        let username = k0?.name?.replace(/[^a-zA-Z0-9 ]/g, "");
+        const exists = await getUser(username);
+        if (!username || exists) username = key.substr(0, 24);
+
+        user = {
+          username,
+          password: v4(),
+          pubkey: key,
+        };
+
+        user = await register(user, ip);
+        user.display = k0.display_name || k0.displayName;
+        user.picture = k0.picture;
+        user.banner = k0.banner;
+        user.about = k0.about;
+        await s(`user:${user.id}`, user);
+      }
+
+      const { username } = user;
+      l("nostr login", username, ip);
+
+      const payload = { id: user.id };
+      const token = jwt.sign(payload, config.jwt);
+      res.cookie("token", token, {
+        expires: new Date(Date.now() + 432000000),
+        path: "/",
+        httpOnly: true,
+        secure: true,
+        sameSite: "lax",
+      });
+      user = pick(user, whitelist);
+      res.send({ user, token });
+    } catch (e) {
+      err("nostr login error", e.message, req.socket.remoteAddress);
+      res.code(401).send({});
+    }
+  },
+
+  async subscriptions(req, res) {
+    try {
+      const { user } = req;
+      const subscriptions = await db.sMembers(`${user.id}:subscriptions`);
+      res.send(subscriptions);
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async subscription(req, res) {
+    try {
+      const { subscription } = req.body;
+      const { id } = req.user;
+      await db.sAdd(`${id}:subscriptions`, JSON.stringify(subscription));
+      res.send(subscription);
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async deleteSubscription(req, res) {
+    try {
+      const { subscription } = req.body;
+      const { id } = req.user;
+      await db.sRem(`${id}:subscriptions`, JSON.stringify(subscription));
+      res.send(subscription);
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async password(req, res) {
+    const {
+      body: { password },
+      user,
+    } = req;
+    if (!user.password) return res.send(true);
+
+    try {
+      if (!password) fail("password not provided");
+      res.send(await Bun.password.verify(password, user.password));
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async pin(req, res) {
+    const {
+      body: { pin },
+      user,
+    } = req;
+    res.send(!user.pin || user.pin === pin);
+  },
+
+  async otpsecret(req, res) {
+    try {
+      await requirePin(req);
+      const { otpsecret, username } = req.user;
+      res.send({ secret: otpsecret, username });
+    } catch (e) {
+      res.code(500).send(e.message);
+    }
+  },
+
+  async contacts(req, res) {
+    const { params, user } = req;
+    const { id } = user;
+    const lastlen = (await g(`${id}:lastlen`)) || 0;
+    const len = await db.lLen(`${id}:payments`);
+    const payments =
+      (await db.lRange(`${id}:payments`, 0, len - lastlen)) || [];
+    await db.set(`${id}:lastlen`, len);
+
+    let contacts = (await g(`${id}:contacts`)) || [];
+    const pins = await db.sMembers(`${id}:pins`);
+    const trust = await db.sMembers(`${id}:trust`);
+
+    for (const { ref } of (
+      await Promise.all(
+        payments.reverse().map(async (id) => await gf(`payment:${id}`)),
+      )
+    ).filter((p) => p && p.type === PaymentType.internal && p.ref)) {
+      if (ref === id) continue;
+      const i = contacts.findIndex((c) => c && c.id === ref);
+      if (~i) contacts.splice(i, 1);
+      let u = await g(`user:${ref}`);
+      if (typeof u === "string") u = await g(`user:${ref}`);
+      if (u) contacts.unshift(pick(u, ["id", "picture", "username"]));
+    }
+
+    await s(`${id}:contacts`, contacts);
+
+    const pinned = contacts
+      .filter((c) => pins.includes(c.id))
+      .sort((a, b) => a.username.localeCompare(b.username));
+
+    pinned.map((c) => {
+      c.pinned = true;
+    });
+
+    const trusted = contacts
+      .filter((c) => trust.includes(c.id))
+      .sort((a, b) => a.username.localeCompare(b.username));
+
+    trusted.map((c) => {
+      c.trusted = true;
+    });
+
+    let { limit } = params;
+    limit ||= contacts.length;
+    contacts = contacts.filter((c) => !pins.includes(c.id));
+    contacts = contacts.slice(0, limit);
+
+    const combined = [...pinned, ...contacts];
+
+    res.send(combined);
+  },
+
+  async del(req, res) {
+    let {
+      params: { username },
+      headers: { authorization },
+    } = req;
+    fail("Unauthorized");
+    username = username.toLowerCase();
+    if (!authorization?.includes(config.admin))
+      return res.code(401).send("unauthorized");
+
+    const { id, pubkey } = await g(
+      `user:${await g(`user:${username.replace(/\s/g, "").toLowerCase()}`)}`,
+    );
+    const invoices = await db.lRange(`${id}:invoices`, 0, -1);
+    const payments = await db.lRange(`${id}:payments`, 0, -1);
+
+    for (const { id } of invoices) db.del(`invoice:${id}`);
+    for (const { id } of payments) db.del(`payment:${id}`);
+    db.del(`user:${username.toLowerCase()}`);
+    db.del(`user:${id}`);
+    db.del(`user:${pubkey}`);
+
+    res.send({});
+  },
+
+  // Authenticated self-delete: wipes every key tied to the calling user,
+  // mirroring scripts/delall-legacy.ts. Gated by typing the username (works for
+  // password and nostr accounts alike) and refuses while a balance remains so a
+  // user can't accidentally destroy funds.
+  async deleteSelf(req, res) {
+    try {
+      const { user } = req;
+      const { id, username, pubkey } = user;
+
+      const confirm = (req.body?.confirm || "").toString().trim().toLowerCase();
+      if (confirm !== username.toLowerCase())
+        fail("Type your username to confirm account deletion");
+
+      // Allow deletion through dust (often too small to withdraw); only block
+      // a meaningful balance so nobody destroys real funds by accident. Sum
+      // EVERY account (main + sub-accounts) — the deletion loop below wipes each
+      // sub-account's balance:/pending: keys unconditionally, so a guard that
+      // only checked the main account let a user with funds parked in a
+      // sub-account pass and silently destroy them.
+      const aids = await db.lRange(`${id}:accounts`, 0, -1);
+      if (!aids.includes(id)) aids.push(id);
+      let total = 0;
+      for (const aid of aids) {
+        total += Number(await db.get(`balance:${aid}`)) || 0;
+        total += Number(await db.get(`pending:${aid}`)) || 0;
+      }
+      if (total > 10000)
+        fail("Withdraw your balance before deleting your account");
+
+      const keys = [
+        `user:${id}`,
+        // username->uid mapping is stored lowercased+despaced (see register.ts);
+        // include both forms so a mixed-case username can't leave a dangling alias.
+        `user:${username.toLowerCase().replace(/\s/g, "")}`,
+        `user:${username}`,
+        `${id}:payments`,
+        `${id}:payments:last`,
+        `${id}:apps`,
+        `${id}:lastlen`,
+        `${id}:accounts`,
+        `${id}:contacts`,
+        `${id}:invoices`,
+        `${id}:items`,
+        `${id}:pins`,
+        `${id}:subscriptions`,
+        `${id}:trust`,
+        `${id}:square`,
+        `${id}:codeVerifier`,
+        `account:${id}`,
+        `balance:${id}`,
+        `pending:${id}`,
+        `credit:bitcoin:${id}`,
+        `credit:lightning:${id}`,
+        `credit:liquid:${id}`,
+      ];
+
+      if (pubkey) {
+        keys.push(
+          `user:${pubkey}`,
+          `${pubkey}:follows`,
+          `${pubkey}:follows:n`,
+          `${pubkey}:followers`,
+          `${pubkey}:followers:n`,
+          `${pubkey}:pubkeys`,
+        );
+        if (user.nip5) await db.sRem("nip5", `${username}:${pubkey}`);
+      }
+
+      // Connected NWC apps: drop each app record + its payment index.
+      // `${id}:apps` is a SET (sAdd in register.ts), so use sMembers, not lRange.
+      for (const ap of await db.sMembers(`${id}:apps`))
+        keys.push(`app:${ap}`, `${ap}:payments`);
+
+      // Sub-accounts and their payment records.
+      for (const aid of await db.lRange(`${id}:accounts`, 0, -1)) {
+        if (aid === id) continue;
+        for (const pid of await db.lRange(`${aid}:payments`, 0, -1))
+          keys.push(`payment:${pid}`);
+        keys.push(
+          `account:${aid}`,
+          `${aid}:payments`,
+          `${aid}:payments:last`,
+          `${aid}:invoices`,
+          `balance:${aid}`,
+          `pending:${aid}`,
+        );
+      }
+
+      // Main-account payment + invoice records.
+      for (const pid of await db.lRange(`${id}:payments`, 0, -1))
+        keys.push(`payment:${pid}`);
+      for (const iid of await db.lRange(`${id}:invoices`, 0, -1))
+        keys.push(`invoice:${iid}`);
+
+      let deleted = 0;
+      for (const k of keys) {
+        if (await db.exists(k)) {
+          await db.del(k);
+          deleted++;
+        }
+      }
+
+      l("user self-deleted", username, id, `${deleted} keys`);
+      try {
+        res.clearCookie("token");
+      } catch {}
+      res.send({ deleted: true });
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async reset(req, res) {
+    const {
+      body: { code, username, password },
+      user: u,
+    } = req;
+    try {
+      const admin = u?.admin;
+      let id;
+      let user;
+
+      // Non-admins must not be able to tell this admin-only endpoint exists.
+      // Log the probe (so exploit-watch can flag it) but return a generic 404
+      // identical to an unregistered route — previously it returned "disabled",
+      // which confirmed the endpoint AND its admin-gating to attackers.
+      if (u?.username !== config.admin) {
+        err("password reset failed disabled", req.headers["cf-connecting-ip"]);
+        return res
+          .code(404)
+          .send({ message: "Route POST:/reset not found", error: "Not Found", statusCode: 404 });
+      }
+      id = await g(`user:${username.toLowerCase().replace(/\s/g, "")}`);
+      user = await g(`user:${id}`);
+
+      if (!user) fail("user not found");
+
+      warn(
+        "password reset",
+        user.username,
+        code,
+        req.headers["cf-connecting-ip"],
+      );
+
+      user.pin = null;
+      user.nsec = null;
+
+      user.password = await Bun.password.hash(password, {
+        algorithm: "bcrypt",
+        cost: 12,
+      });
+
+      await s(`user:${id}`, user);
+      await db.del(`reset:${code}`);
+
+      const un = username.toLowerCase().replace(/\s/g, "");
+      await db.del(`${un}:failures`);
+
+      res.send(pick(user, whitelist));
+
+      for await (const k of db.scanIterator({ MATCH: "ip:*:login:fail" })) {
+        await db.del(k);
+      }
+    } catch (e) {
+      err("password reset failed", e.message, req.headers["cf-connecting-ip"]);
+      bail(res, e.message);
+    }
+  },
+
+  async printerlogin(req, res) {
+    const {
+      body: { username, topic },
+    } = req;
+    if (username === topic) res.send({ ok: true });
+    else bail(res, "unauthorized");
+  },
+
+  async acl(req, res) {
+    const {
+      body: { username, topic },
+    } = req;
+    if (username === topic) res.send({ ok: true });
+    else bail(res, "unauthorized");
+  },
+
+  async superuser(req, res) {
+    const {
+      body: { username },
+    } = req;
+    if (username === config.mqtt2.username) res.send({ ok: true });
+    else bail(res, "unauthorized");
+  },
+
+  async request(req, res) {
+    const { email } = req.body;
+    const { user } = req;
+    const { id } = user;
+
+    try {
+      if (await g(`email:${email.toLowerCase()}`)) fail("Email already in use");
+
+      const { username } = user;
+
+      if (email !== user.email) {
+        user.verified = false;
+        await s(`user:${id}`, user);
+        user.email = email;
+      }
+
+      const code = v4();
+      await s(`verify:${code}`, { id, email });
+      const link = `${process.env.URL}/verify/${code}`;
+      const subject = "Email Verification";
+
+      l("verifying email", user.username, email);
+
+      await mail(user, subject, templates.verifyEmail, {
+        username,
+        link,
+      });
+
+      res.send({ ok: true });
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async verify(req, res) {
+    const {
+      params: { code },
+    } = req;
+    try {
+      const { id, email } = await g(`verify:${code}`);
+      if (!id) fail("verification failed");
+      const user = await g(`user:${id}`);
+      user.email = email;
+      user.verified = true;
+      await s(`user:${id}`, user);
+      await s(`email:${email.toLowerCase()}`, id);
+
+      res.send(pick(user, fields));
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async forgot(req, res) {
+    const {
+      body: { email },
+    } = req;
+    try {
+      const uid = await g(`email:${email.toLowerCase()}`);
+      const user = await g(`user:${uid}`);
+
+      if (user) {
+        const code = v4();
+        const link = `${process.env.URL}/reset/${code}`;
+        await db.set(`reset:${code}`, uid, { EX: 300 });
+
+        await mail(user, "Password reset", templates.passwordReset, {
+          ...user,
+          link,
+        });
+      }
+
+      res.send({});
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async hidepay(req, res) {
+    const {
+      body: { username },
+    } = req;
+    const u = await getUser(username);
+    u.hidepay = true;
+    await s(`user:${u.id}`, u);
+    res.send({});
+  },
+
+  async unlimit(req, res) {
+    const {
+      body: { username },
+    } = req;
+    const u = await getUser(username);
+    u.unlimited = true;
+    await s(`user:${u.id}`, u);
+    res.send({});
+  },
+
+  async account(req, res) {
+    const { id } = req.params;
+    const { id: uid } = req.user;
+
+    const pos = await db.lPos(`${uid}:accounts`, id);
+    if (pos == null) fail("account not found");
+
+    const account = await g(`account:${id}`);
+    if (account) account.balance = await g(`balance:${id}`);
+    res.send(account);
+  },
+
+  async accounts(req, res) {
+    try {
+      const { user } = req;
+
+      const accounts = [];
+      for (const id of await db.lRange(`${user.id}:accounts`, 0, -1)) {
+        const account = await g(`account:${id}`);
+        if (account) {
+          account.balance = await g(`balance:${id}`);
+          accounts.push(account);
+        }
+      }
+
+      res.send(accounts.reverse());
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async createAccount(req, res) {
+    try {
+      const { name, type } = req.body;
+      const { user } = req;
+
+      const id = v4();
+      const account = { id, name, type, uid: user.id };
+
+      await db
+        .multi()
+        .set(`account:${id}`, JSON.stringify(account))
+        .set(`balance:${id}`, 0)
+        .set(`pending:${id}`, 0)
+        .lPush(`${user.id}:accounts`, id)
+        .exec();
+
+      res.send(account);
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async updateAccount(req, res) {
+    const { id } = req.params;
+    const { id: uid } = req.user;
+    const { name } = req.body;
+
+    const pos = await db.lPos(`${uid}:accounts`, id);
+    if (pos == null) fail("account not found");
+
+    const account = await g(`account:${id}`);
+    account.name = name;
+    await s(`account:${id}`, account);
+
+    res.send(account);
+  },
+
+  async deleteAccount(req, res) {
+    try {
+      const { id } = req.body;
+      const { id: uid } = req.user;
+      const account = await g(`account:${id}`);
+
+      const pos = await db.lPos(`${uid}:accounts`, id);
+      if (!(account && pos != null)) fail("account not found");
+
+      await db
+        .multi()
+        .lRem(`${uid}:accounts`, 1, id)
+        .del(`account:${id}`)
+        .del(`balance:${id}`)
+        .del(`${id}:payments`)
+        .exec();
+
+      res.send({ ok: true });
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async flash(req, res) {
+    const { ssid, key, token } = req.body;
+    const cfg = `${ssid.trim()}\n${key.trim()}\n${token.trim()}\n`;
+    await writeFile("./printer/config.txt", cfg, "utf8");
+    await $`./mklittlefs -c ./printer -p 256 -b 4096 -s 0x20000 ./littlefs.img`;
+    res.header("Content-Type", "application/octet-stream");
+    return res.send(createReadStream("./littlefs.img"));
+  },
+
+  async app(req, res) {
+    const { pubkey } = req.params;
+    const { user } = req;
+    const app = await g(`app:${pubkey}`);
+    // Missing records must 404, not crash into a 500: clients (Damus one-click
+    // setup) probe this endpoint and treat 404 as "not configured yet, create
+    // one" — anything else aborts their whole connection flow.
+    if (!app) return res.code(404).send({ error: "connection not found" });
+    if (app.uid !== user.id) fail("unauthorized");
+
+    const lud16 = `${user.username}@${host}`;
+
+    const pids = (await db.lRange(`${pubkey}:payments`, 0, -1)) || [];
+
+    const payments = await Promise.all(
+      pids.map(async (pid) => {
+        const p = await gf(`payment:${pid}`);
+        if (p) p.user = await g(`user:${p.uid}`);
+        return p;
+      }),
+    );
+
+    app.nwc = `nostr+walletconnect://${serverPubkey2}?relay=${relay}&secret=${app.secret}&lud16=${lud16}`;
+    app.payments = payments.filter((p) => p);
+
+    res.send(app);
+  },
+
+  async apps(req, res) {
+    const { user } = req;
+    const pubkeys = await db.sMembers(`${user.id}:apps`);
+    // Drop set members whose app record was deleted (e.g. an invalidation
+    // sweep) so one stale pubkey can't 500 the whole listing.
+    const apps = (await Promise.all(pubkeys.map((p) => g(`app:${p}`)))).filter(
+      Boolean,
+    );
+
+    const lud16 = `${user.username}@${host}`;
+
+    await Promise.all(
+      apps.map(async (a) => {
+        if (a.secret)
+          a.nwc = `nostr+walletconnect://${serverPubkey2}?relay=${relay}&secret=${a.secret}&lud16=${lud16}`;
+
+        const pids = await db.lRange(`${a.pubkey}:payments`, 0, -1);
+        let payments = await Promise.all(
+          pids.map((pid) => gf(`payment:${pid}`)),
+        );
+        payments = payments.filter((p) => p);
+        a.spent = payments.reduce(
+          (a, b) =>
+            a +
+            (Math.abs(Number.parseInt(b.amount || 0)) +
+              Number.parseInt(b.tip || 0) +
+              Number.parseInt(b.fee || 0) +
+              Number.parseInt(b.ourfee || 0)),
+          0,
+        );
+      }),
+    );
+
+    res.send(apps);
+  },
+
+  async updateApp(req, res) {
+    try {
+      let {
+        secret,
+        pubkey,
+        max_amount,
+        max_fee,
+        budget_renewal,
+        name,
+        notify,
+      } = req.body;
+
+      const { user } = req;
+      const uid = user.id;
+      if (secret) pubkey = getPublicKey(hexToBytes(secret));
+
+      // App records live under `app:<pubkey>`. Looking up the bare pubkey made
+      // this ownership check ineffective for normal NWC keys and allowed an
+      // authenticated user to overwrite another connection's configuration.
+      let app = await g(`app:${pubkey}`);
+      if (app && uid !== app.uid) fail("Unauthorized");
+
+      // Rotation is mandatory after a credential disclosure: the NWC pubkey is
+      // derived from the bearer secret, so re-registering a retired or
+      // quarantined pubkey would re-authorize the exact secret that was
+      // disclosed (we store client-supplied secrets, so they're part of any DB
+      // leak). Reject it and make the client mint a fresh secret — a new secret
+      // yields a new pubkey and never trips this check.
+      const credentialCutoff = Number(await g("nwc:credential-cutoff")) || 0;
+      const retired =
+        (app &&
+          credentialCutoff > 0 &&
+          (!Number(app.created) || Number(app.created) < credentialCutoff)) ||
+        (await db.sIsMember("nwc:quarantined", pubkey));
+      if (retired)
+        return res.code(403).send({
+          error:
+            "This connection's key was retired for security reasons; connect again with a newly generated secret",
+        });
+
+      const validRenewals = new Set([
+        "daily",
+        "weekly",
+        "monthly",
+        "yearly",
+        "never",
+      ]);
+      if (budget_renewal && !validRenewals.has(budget_renewal))
+        fail("Invalid budget renewal period");
+
+      for (const [label, value] of [
+        ["spending budget", max_amount],
+        ["maximum fee", max_fee],
+      ]) {
+        if (
+          value !== undefined &&
+          value !== null &&
+          value !== "" &&
+          (!Number.isFinite(Number(value)) || Number(value) < 0)
+        )
+          fail(`Invalid ${label}`);
+      }
+
+      // Notifications are opt-in (default off): most users don't consume them and
+      // publishing payment_sent/payment_received for every app would flood the
+      // relay. A client enables them by sending notify:"true" when creating the
+      // connection. (Reverted a brief default-on change, 2026-06-06.)
+      notify = String(notify) === "true";
+
+      app = {
+        ...app,
+        pubkey,
+        max_amount,
+        max_fee,
+        budget_renewal,
+        name,
+        notify,
+        uid,
+        secret,
+      };
+
+      // Refresh the creation epoch on every owner post: this record passed the
+      // retirement check above, so the owner updating it (or minting it fresh)
+      // asserts it's live and keeps it clear of the credential cutoff.
+      app.created = Date.now();
+
+      await s(`app:${pubkey}`, app);
+      await db.sAdd(`${uid}:apps`, pubkey);
+
+      res.send({});
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async deleteApp(req, res) {
+    try {
+      const { user } = req;
+      const uid = user.id;
+      const { pubkey } = req.body;
+      const app = await g(`app:${pubkey}`);
+      if (app && uid !== app.uid) {
+        warn(app.uid, uid);
+        fail("Unauthorized");
+      }
+      await db.sRem(`${uid}:apps`, pubkey);
+      await db.del(`app:${pubkey}`);
+      res.send({});
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async addPin(req, res) {
+    const { id: uid } = req.user;
+    const { id } = req.body;
+    await db.sAdd(`${uid}:pins`, id);
+    res.send({});
+  },
+
+  async deletePin(req, res) {
+    const { id: uid } = req.user;
+    const { id } = req.body;
+    await db.sRem(`${uid}:pins`, id);
+    res.send({});
+  },
+
+  async trust(req, res) {
+    const { id } = req.user;
+    res.send(await db.sMembers(`${id}:trust`));
+  },
+
+  async addTrust(req, res) {
+    const { id: uid } = req.user;
+    const { id } = req.body;
+    await db.sAdd(`${uid}:trust`, id);
+    res.send({});
+  },
+
+  async deleteTrust(req, res) {
+    const { id: uid } = req.user;
+    const { id } = req.body;
+    await db.sRem(`${uid}:trust`, id);
+    res.send({});
+  },
+
+  async credits(req, res) {
+    const { id } = req.user;
+    const bitcoin = await g(`credit:bitcoin:${id}`);
+    const lightning = await g(`credit:lightning:${id}`);
+    const liquid = await g(`credit:liquid:${id}`);
+    res.send({ bitcoin, lightning, liquid });
+  },
+
+  async ro(req, res) {
+    const { user } = req;
+    const payload = { id: `${user.id}-ro` };
+    const token = jwt.sign(payload, config.jwt);
+    res.send(token);
+  },
+};

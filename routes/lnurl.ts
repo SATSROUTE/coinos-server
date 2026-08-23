@@ -1,0 +1,305 @@
+import { db, g, gf, s } from "$lib/db";
+import { generate } from "$lib/invoices";
+import { err, warn } from "$lib/logging";
+import { serverPubkey2 } from "$lib/nostr";
+import { SATS, bail, fail, getInvoice, getUser } from "$lib/utils";
+import { bech32 } from "bech32";
+import { safeGot } from "$lib/safe-fetch";
+import { verifyEvent } from "nostr-tools";
+import { v4 } from "uuid";
+
+import { PaymentType } from "$lib/types";
+
+const { URL } = process.env;
+const host = URL.split("/").at(-1);
+const fiveMinutes = 1000 * 60 * 5;
+// v3 payment addresses (coinos v3 / halwallet) are registered here.
+const NAMES_URL = process.env.NAMES_URL || "https://names.coinos.io";
+
+// Does the v3 registrar serve this name? Returns its payRequest, or null.
+// Cached briefly: claims change on the order of days, and this sits on the
+// payment path for every coinos.io address lookup. Only definitive answers
+// (payRequest / 404) are cached — a sick registrar shouldn't be remembered.
+const registrarCache = new Map();
+const REGISTRAR_TTL = 60_000;
+async function registrarLookup(name) {
+  const hit = registrarCache.get(name);
+  if (hit && Date.now() - hit.at < REGISTRAR_TTL) return hit.body;
+  try {
+    const r = await fetch(
+      `${NAMES_URL}/.well-known/lnurlp/${encodeURIComponent(name)}?domain=${host}`,
+      { signal: AbortSignal.timeout(3000) },
+    );
+    if (r.ok) {
+      const body: any = await r.json();
+      if (body?.tag === "payRequest") {
+        registrarCache.set(name, { at: Date.now(), body });
+        return body;
+      }
+    }
+    if (r.status === 404) registrarCache.set(name, { at: Date.now(), body: null });
+  } catch (e) {
+    warn("names registrar lookup failed for", name, (e as any).message);
+  }
+  return null;
+}
+
+export default {
+  async encode(req, res) {
+    const {
+      query: { address },
+    } = req;
+    const [name, domain] = address.split("@");
+    const url = `https://${domain}/.well-known/lnurlp/${name
+      .toLowerCase()
+      .replace(/\s/g, "")}`;
+
+    try {
+      const r = await safeGot(url);
+      if (r.tag !== "payRequest") fail("not an ln address");
+    } catch (e) {
+      const m = `failed to lookup lightning address ${address}`;
+      warn(m);
+      return bail(res, m);
+    }
+
+    const enc = bech32.encode("lnurl", bech32.toWords(Buffer.from(url)), 20000);
+    res.send(enc);
+  },
+
+  async decode(req, res) {
+    const {
+      query: { text },
+    } = req;
+    try {
+      const url = Buffer.from(
+        bech32.fromWords(bech32.decode(text, 20000).words),
+      ).toString();
+
+      const r = await safeGot(url);
+      res.send(r);
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async lnurlp(req, res) {
+    const {
+      params: { username },
+      query: { minSendable = 1000, maxSendable = 100000000000 },
+    } = req;
+    try {
+      const name = username
+        .replace("lightning:", "")
+        .replace(/\s/g, "")
+        .replace("=", "")
+        .toLowerCase();
+
+      // Resolution order for name@coinos.io — this has flip-flopped twice, so
+      // the invariant, in full:
+      //   1. A name CLAIMED in the v3 registrar is served by it. That is where
+      //      migrated accounts live — their legacy user record still exists
+      //      here, so "local account exists" does NOT mean the name is ours —
+      //      and also v3-native custom names, which have no local account and
+      //      only a npub1* Cloudflare rule redirecting for them today.
+      //   2. Otherwise a local account is served locally. Never key this on
+      //      `migrated`: register.ts stamps that flag on essentially every
+      //      account (it means "don't reserve this name for v3", not "user
+      //      moved away").
+      //   3. Neither → not found.
+      // No loop: step 1 defers only for names the registrar HAS, and the
+      // registrar never queries this endpoint for those. If the registrar is
+      // unreachable we fall through and serve the local account — a briefly
+      // stale destination beats an unpayable address.
+      const v3 = await registrarLookup(name);
+      if (v3) return res.send(v3);
+
+      const user = await getUser(name);
+      if (!user) fail(`User ${username} not found`);
+      const { id: uid } = user;
+
+      const metadata = JSON.stringify([
+        ["text/plain", `Paying ${username}@${host}`],
+        ["text/identifier", `${username}@${host}`],
+      ]);
+
+      const id = v4();
+      await s(`lnurl:${id}`, uid);
+
+      res.send({
+        allowsNostr: true,
+        minSendable,
+        maxSendable,
+        metadata,
+        nostrPubkey: serverPubkey2,
+        commentAllowed: 512,
+        callback: `${URL}/api/lnurl/${id}`,
+        tag: "payRequest",
+      });
+    } catch (e) {
+      if (!e.message.includes("found"))
+        warn("problem generating lnurlp request", username, e.message);
+      bail(res, e.message);
+    }
+  },
+
+  async lnurl(req, res) {
+    const {
+      params: { id },
+      query: { amount, comment, nostr },
+    } = req;
+    try {
+      const iid = await g(`lnurl:${id}:invoice`);
+      const uid = await g(`lnurl:${id}`);
+      const user = await getUser(uid);
+
+      if (!user) fail("user not found");
+      let { username } = user;
+      username = username.replace(/\s/g, "").toLowerCase();
+
+      let metadata = JSON.stringify([
+        ["text/plain", `Paying ${username}@${host}`],
+        ["text/identifier", `${username}@${host}`],
+      ]);
+
+      if (nostr) {
+        try {
+          const event = JSON.parse(decodeURIComponent(nostr));
+          // NIP-57: must be a signed kind-9734 zap request. Reject anything
+          // else so we can't be tricked into storing a forged zap receipt.
+          if (event.kind !== 9734 || !verifyEvent(event))
+            throw new Error("invalid zap request");
+          await s(`zap:${id}`, event);
+          metadata = nostr;
+        } catch (e) {
+          err("problem handling zap", e.message);
+        }
+      }
+
+      const invoice = iid
+        ? await gf(`invoice:${iid}`)
+        : await generate({
+            invoice: {
+              amount: Math.round(amount / 1000),
+              memo: metadata,
+              type: PaymentType.lightning,
+            },
+            user,
+          });
+
+      if (comment) {
+        // Enforce the commentAllowed:512 we advertise in the lnurlp response.
+        // This overwrite happens after generate()'s own memo validation, so an
+        // uncapped comment would otherwise reach credit() at settlement time.
+        invoice.memo = String(comment).slice(0, 512);
+        await s(`invoice:${invoice.id}`, invoice);
+      }
+
+      res.send({
+        pr: invoice.text,
+        routes: [],
+        verify: `${URL}/api/lnurl/verify/${invoice.id}`,
+      });
+    } catch (e) {
+      bail(res, e.message);
+    }
+  },
+
+  async proxy(req, res) {
+    const { url } = req.query;
+    if (!url) return bail(res, "url required");
+    try {
+      const r = await safeGot(url);
+      res.send(r);
+    } catch (e) {
+      warn("lnurl proxy failed", url, e.message);
+      bail(res, e.message);
+    }
+  },
+
+  async verify(req, res) {
+    const {
+      params: { id },
+    } = req;
+    const inv = await getInvoice(id);
+    if (!inv) return res.send({ status: "ERROR", reason: "Not found" });
+
+    const { hash, received, amount, preimage } = inv;
+    const settled = received >= amount;
+
+    res.send({ pr: hash, status: "OK", settled, preimage: preimage || null });
+  },
+
+  async pay(req, res) {
+    const { amount, username } = req.params;
+    try {
+      const user = await getUser(username);
+
+      const invoices = await db.lRange(`${user.id}:invoices`, 0, 10);
+      let invoice;
+
+      for (const iid of invoices) {
+        const i = await getInvoice(iid);
+        const paid = i.amount > 0 && i.received >= i.amount;
+        const old = Date.now() - i.created > fiveMinutes;
+        if (paid) break;
+        if (i.own && !old) {
+          invoice = i;
+          break;
+        }
+      }
+
+      if (invoice) {
+        if (amount?.startsWith("+")) {
+          const tip = invoice.amount * amount.split("+")[1];
+          invoice = await generate({
+            invoice: {
+              ...invoice,
+              tip,
+            },
+            user,
+          });
+        }
+      } else {
+        invoice = await generate({
+          invoice: {
+            amount,
+            prompt: user.prompt,
+            type: PaymentType.lightning,
+          },
+          user,
+        });
+      }
+
+      const { id: uid } = user;
+
+      const metadata = JSON.stringify([
+        ["text/plain", `Paying ${username}@${host}`],
+        ["text/identifier", `${username}@${host}`],
+      ]);
+
+      const id = v4();
+      
+      const total =
+        (parseInt(invoice.amount || 0) + parseInt(invoice.tip || 0)) * 1000;
+
+      await s(`lnurl:${id}`, uid);
+      if (total > 0) await s(`lnurl:${id}:invoice`, invoice.id);
+
+      res.send({
+        allowsNostr: true,
+        minSendable: invoice.amount ? total : 1000,
+        maxSendable: invoice.amount ? total : 10 * 1000 * SATS,
+        metadata,
+        nostrPubkey: serverPubkey2,
+        commentAllowed: 512,
+        callback: `${URL}/api/lnurl/${id}`,
+        tag: "payRequest",
+      });
+    } catch (e) {
+      if (!e.message.includes("found"))
+        warn("problem generating lnurlp request", username, e.message);
+      bail(res, e.message);
+    }
+  },
+};

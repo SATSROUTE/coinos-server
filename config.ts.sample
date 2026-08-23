@@ -1,0 +1,56 @@
+import { SquareEnvironment } from "square";
+
+export default {
+  archive: "redis://archive",
+  db: "redis://db",
+  nostr: "ws://nostr:8080",
+  relays: [
+    "ws://nostr:8080",
+    "wss://nostr-pub.wellorder.net",
+    "wss://brb.io",
+    "wss://nostr.v0l.io",
+    "wss://relay.nostr.bg",
+    "wss://nostr.orangepill.dev"
+  ],
+  // SECURITY: generate a fresh 32-byte secret before deploying —
+  // `openssl rand -hex 32`. This also keys @fastify/secure-session, so a
+  // published value lets anyone forge session JWTs and read the session cookie.
+  jwt: "0000000000000000000000000000000000000000000000000000000000000000",
+  bitcoin: {
+    host: "bc",
+    wallet: "coinos",
+    user: "admin1",
+    password: "123",
+    network: "regtest",
+    port: 18443,
+  },
+  liquid: {
+    host: "lq",
+    wallet: "coinos",
+    user: "admin1",
+    password: "123",
+    network: "regtest",
+    port: 7040,
+    btc: "5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225"
+  },
+  lightning: "/home/bun/app/data/lightning/regtest/lightning-rpc",
+  lightningb: "/home/bun/app/data/lightningb/regtest/lightning-rpc",
+  fee: 0.001,
+  // SECURITY: the admin login path is disabled when this is empty (fails
+  // closed). Set a strong, unique value only if you need admin impersonation;
+  // never ship the sample value.
+  adminpass: "",
+  support: "support@coinos.io",
+  // SECURITY: generate fresh keys — never deploy these sample values. These are
+  // the server NWC wallet-service key and the zap-receipt signer.
+  //   node -e "import('nostr-tools').then(n=>console.log(n.nip19.nsecEncode(n.generateSecretKey())))"
+  nostrKey: "nsec1replacewithafreshlygeneratedkeydonotusethissamplevalue0",
+  nostrKey2: "nsec1replacewithafreshlygeneratedkeydonotusethissamplevalue1",
+  mintUrl: "http://mint:3338",
+  square: {
+    environment: SquareEnvironment.Sandbox,
+    appId: "sandbox-sq0adb-9QbyDZeHTPc_RhFSEr_SaQ",
+    url: "https://connect.squareupsandbox.com/",
+    scopes: ["MERCHANT_PROFILE_READ", "ORDERS_READ", "PAYMENTS_READ"],
+  },
+};

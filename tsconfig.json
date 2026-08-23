@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    // Enable latest features
+    "lib": ["ESNext"],
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleDetection": "force",
+    "jsx": "react-jsx",
+    "allowJs": true,
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+
+    // Best practices
+    "strict": false,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+
+    // Some stricter flags
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noAssignInExpressions": false,
+
+    "baseUrl": ".",
+    "paths": {
+      "$lib/*": ["./lib/*.ts"],
+      "$routes/*": ["./routes/*.ts"],
+      "$config": ["./config.ts"],
+      "@cashu/cashu-ts": ["node_modules/@cashu/cashu-ts/dist/lib/es6/index.js"]
+    }
+  }
+}
