@@ -958,7 +958,9 @@ export const sendLightning = async ({
       amount_msat: amount_msat ? undefined : amount * 1000,
       maxfee: fee * 1000,
       retry_for: 30,
-      layers: ["prefer-kappa"],
+      // layers: askrene "prefer-kappa" e uma layer de ops interna do Coinos
+      // (populada fora do codigo); nosso no nao a tem e o xpay rejeita
+      // "unknown layer". Removida -> roteamento padrao do xpay.
     });
 
     // Only log the xpay response when there's a real concern — no preimage
