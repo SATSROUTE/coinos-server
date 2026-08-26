@@ -3,6 +3,7 @@ import store from "$lib/store";
 import jwt from "jsonwebtoken";
 import { v4 } from "uuid";
 import { err, warn } from "$lib/logging";
+import { versionOk } from "$lib/tokens";
 import { fail, getUser } from "$lib/utils";
 
 // Verify the token's signature — never trust jwt.decode() here. A decode-only
@@ -56,9 +57,16 @@ export const broadcast = (type, data) => {
 
 const track = async (ws, token) => {
   const { id } = ws;
-  const { id: uid } = verifyToken(token) || {};
+  const payload = verifyToken(token) || {};
+  const { id: uid } = payload;
 
   if (!uid) fail("Invalid JWT token");
+
+  // Same session-generation gate as the HTTP side. Without it a revoked token
+  // would still be good enough to open a socket and keep receiving every emit
+  // for the account — including balances and payment notifications.
+  if (!(await versionOk(payload))) fail("Revoked JWT token");
+
   const user = await getUser(uid);
   if (!user) fail(`User not found ${uid}`);
 

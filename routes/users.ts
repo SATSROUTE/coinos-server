@@ -18,6 +18,7 @@ import jwt from "jsonwebtoken";
 import { getPublicKey, nip19, verifyEvent } from "nostr-tools";
 import { hexToBytes } from "@noble/hashes/utils";
 import { authenticator } from "otplib";
+import { issue, revokeSessions } from "$lib/tokens";
 import { v4 } from "uuid";
 
 import { PaymentType } from "$lib/types";
@@ -180,8 +181,7 @@ export default {
       const fields = ["pubkey", "password", "username", "picture", "fresh"];
       user = await register(pick(user, fields), ip);
 
-      const payload = { id: user.id };
-      const token = jwt.sign(payload, config.jwt);
+      const token = await issue(user.id);
 
       l("registered new user", user.username);
 
@@ -452,8 +452,7 @@ export default {
       if (username !== "coinos")
         l("logged in", username, req.headers["cf-connecting-ip"]);
 
-      const payload = { id: user.id };
-      const token = jwt.sign(payload, config.jwt);
+      const token = await issue(user.id);
       res.cookie("token", token, {
         expires: new Date(Date.now() + 432000000),
         path: "/",
@@ -518,8 +517,7 @@ export default {
       const { username } = user;
       l("nostr login", username, ip);
 
-      const payload = { id: user.id };
-      const token = jwt.sign(payload, config.jwt);
+      const token = await issue(user.id);
       res.cookie("token", token, {
         expires: new Date(Date.now() + 432000000),
         path: "/",
@@ -1290,8 +1288,26 @@ export default {
 
   async ro(req, res) {
     const { user } = req;
-    const payload = { id: `${user.id}-ro` };
-    const token = jwt.sign(payload, config.jwt);
+    const token = await issue(`${user.id}-ro`);
     res.send(token);
+  },
+
+  // Ends every session of the calling account — this device and all others.
+  // Deleting the cookie alone never did that: the token kept working from the
+  // Authorization header. Operators can do the same for a suspected-compromised
+  // account without touching the user's password:
+  //   keydb-cli INCR tokenver:<uid>
+  async logout(req, res) {
+    const { id, username } = req.user;
+    await revokeSessions(id);
+    l("sessions revoked", username);
+    res.cookie("token", "", {
+      expires: new Date(0),
+      path: "/",
+      httpOnly: true,
+      secure: true,
+      sameSite: "lax",
+    });
+    res.send({ ok: true });
   },
 };

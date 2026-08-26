@@ -46,6 +46,15 @@ export default {
   //   node -e "import('nostr-tools').then(n=>console.log(n.nip19.nsecEncode(n.generateSecretKey())))"
   nostrKey: "nsec1replacewithafreshlygeneratedkeydonotusethissamplevalue0",
   nostrKey2: "nsec1replacewithafreshlygeneratedkeydonotusethissamplevalue1",
+  // Validade dos tokens de sessao. Antes eles nao expiravam: um token vazado
+  // (log, backup, XSS, celular perdido) valia para sempre. Ver lib/tokens.ts.
+  tokenTtl: "30d",
+  // Reconciliacao ledger x nos (lib/reconcile.ts). Intervalo em segundos;
+  // limiares de deficit em sats. Acima de reconcileLockSats o job aciona
+  // sozinho o kill switch /locks/ALL.locked.
+  reconcileInterval: 300,
+  reconcileWarnSats: 10000,
+  reconcileLockSats: 1000000,
   mintUrl: "http://mint:3338",
   square: {
     environment: SquareEnvironment.Sandbox,

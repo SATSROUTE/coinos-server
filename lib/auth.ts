@@ -1,5 +1,6 @@
 import config from "$config";
 import { db } from "$lib/db";
+import { versionOk } from "$lib/tokens";
 import { fail, getUser } from "$lib/utils";
 import fastifyPassport from "@fastify/passport";
 import jwt from "passport-jwt";
@@ -53,6 +54,11 @@ export const jwtStrategy = new jwt.Strategy(
 
     if (id.endsWith("-ro") && wl[m].some((p) => u.startsWith(p)))
       id = id.slice(0, -3);
+
+    // Session generation gate: a revoked token (tokenver bumped) stops
+    // verifying here, so "log out everywhere" works without rotating
+    // config.jwt and logging out every other account with it.
+    if (!(await versionOk(payload))) return next(null, false);
 
     const user = await getUser(id);
 

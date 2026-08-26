@@ -7,6 +7,7 @@ import { getLocations } from "$lib/locations";
 import nwc from "$lib/nwc";
 import { catchUp, check } from "$lib/payments";
 import { getFx } from "$lib/rates";
+import { reconcile } from "$lib/reconcile";
 import { sendHeartbeat } from "$lib/sockets";
 
 import ecash from "$routes/ecash";
@@ -31,6 +32,7 @@ try {
   nwc();
   check();
   startHealthCheck();
+  reconcile();
 } catch (e) {}
 
 setTimeout(listenForLightning, 2000);
@@ -123,6 +125,7 @@ app.post("/account/delete", auth, users.deleteAccount);
 app.get("/users", auth, users.list);
 app.get("/me", auth, users.me);
 app.get("/ro", auth, users.ro);
+app.post("/logout", auth, users.logout);
 app.get("/credits", auth, users.credits);
 app.get("/users/:key", users.get);
 app.post("/register", users.create);
