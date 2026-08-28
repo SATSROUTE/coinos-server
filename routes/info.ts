@@ -28,10 +28,13 @@ export default {
     );
     const lnwallet = parseInt(funds.outputs.reduce((a, b) => a + b.value, 0));
 
-    const cash = getDecodedToken(await g("cash")).proofs.reduce(
-      (a, b) => a + b.amount,
-      0,
-    );
+    // Numa instancia nova a chave `cash` nao existe, e getDecodedToken(null)
+    // estoura com "null is not an object". So aparece em deploy do zero: a
+    // instancia de origem sempre teve a chave.
+    const cashToken = await g("cash");
+    const cash = cashToken
+      ? getDecodedToken(cashToken).proofs.reduce((a, b) => a + b.amount, 0)
+      : 0;
 
     const info = {
       cash,
