@@ -130,6 +130,16 @@ app.register(fastifyRateLimit, {
   },
   max: 10,
   timeWindow: 10000,
+  // ATENCAO: este keyGenerator NAO e o efetivo. Com o plugin registrado duas
+  // vezes no mesmo nivel, quem governa o chaveamento e o primeiro registro
+  // (acima), que usa o IP. Verificado em producao: rotacionar o User-Agent a
+  // cada tentativa NAO contorna o bloqueio (5x 401 e depois 429), e 12
+  // tentativas com CF-Connecting-IP forjado diferente criaram um unico balde,
+  // com o IP real.
+  //
+  // Nao "conserte" isto trocando para o IP achando que esta inativo: o limite
+  // ja e por IP. E nao passe a depender do User-Agent como chave — ele e
+  // escolhido pelo cliente.
   keyGenerator: (req) => (req.headers["user-agent"] as string) || "unknown-ua",
   errorResponseBuilder: () => ({
     statusCode: 429,
