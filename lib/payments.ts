@@ -38,6 +38,7 @@ import {
   t,
 } from "$lib/utils";
 import { callWebhook } from "$lib/webhooks";
+import { enforceWithdrawalPolicy } from "$lib/withdrawals";
 import changeid from "$lib/changeid";
 import rpc from "@coinos/rpc";
 import { bech32 } from "bech32";
@@ -150,6 +151,12 @@ export const debit = async ({
     warn("Blocking", user.username, amount, hash, user.id, type, frozen, userLimit);
     fail("Problem sending payment");
   }
+
+  // Politica de saque por usuario: teto individual, velocidade e carencia de
+  // destino novo. Fica DEPOIS das travas globais (freeze, kill switch, limite
+  // global) — nao adianta contabilizar consumo de um saque que ja estava
+  // barrado — e ANTES da reserva contra o saldo do no.
+  await enforceWithdrawalPolicy({ user, amount, type, hash, whitelisted });
 
   // Atomic check + reserve against the per-asset-type server limit. Decrement
   // immediately so concurrent calls can't reuse the same budget; freezeCheck

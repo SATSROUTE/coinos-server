@@ -48,6 +48,19 @@ export default {
   nostrKey2: "nsec1replacewithafreshlygeneratedkeydonotusethissamplevalue1",
   // Validade dos tokens de sessao. Antes eles nao expiravam: um token vazado
   // (log, backup, XSS, celular perdido) valia para sempre. Ver lib/tokens.ts.
+  // --- Controles de saque (lib/withdrawals.ts) ---
+  // Sobreponiveis por usuario no KeyDB: limit:<uid> e daylimit:<uid>.
+  //
+  // Estes dois nao dependem do modelo de negocio, entao ja vem ligados:
+  velocityMax: 10,         // maximo de saques por janela
+  velocityWindow: 3600,    // janela da velocidade, em segundos
+  newAddressCooloff: 3600, // carencia para endereco de destino nunca visto
+  //
+  // Estes dependem de quanto voce quer que um usuario movimente. 0 = desligado.
+  // DEFINIR ANTES DE ABRIR AO PUBLICO: um teto errado bloqueia cliente
+  // legitimo, e nenhum teto deixa uma conta invadida drenar sem freio.
+  userLimitSats: 0,        // teto por pagamento, por usuario
+  dayLimitSats: 0,         // teto acumulado no dia, por usuario
   tokenTtl: "30d",
   // Reconciliacao ledger x nos (lib/reconcile.ts). Intervalo em segundos;
   // limiares de deficit em sats. Acima de reconcileLockSats o job aciona
