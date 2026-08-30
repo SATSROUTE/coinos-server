@@ -167,12 +167,19 @@ await app.register(cors, {
   credentials: true,
 });
 
-app.setErrorHandler((error, _, reply) => {
+app.setErrorHandler((error: any, _, reply) => {
   if (error instanceof fastify.errorCodes.FST_ERR_BAD_STATUS_CODE) {
     reply.status(500).send({ ok: false });
-  } else {
-    reply.send(error);
+    return;
   }
+
+  // Aplicar o status explicitamente. `reply.send(error)` so honra o codigo
+  // quando o erro e uma instancia de Error; o rate-limit entrega um OBJETO
+  // simples, entao a resposta saia com o corpo dizendo 429 e o HTTP em 200.
+  // Cliente e UI liam aquilo como sucesso, monitoramento por status nao via
+  // nada, e um CDN na frente poderia cachear a resposta (200 e cacheavel) e
+  // servir "rate limit exceeded" para outros usuarios.
+  reply.status(Number(error?.statusCode) || 500).send(error);
 });
 
 app.setNotFoundHandler((_, reply) =>
