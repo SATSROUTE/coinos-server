@@ -1,0 +1,8 @@
+{
+	auto_https off
+	admin off
+}
+
+http://localhost:80 {
+	reverse_proxy ui:3000
+}
