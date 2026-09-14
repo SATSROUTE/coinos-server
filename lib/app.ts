@@ -154,6 +154,17 @@ app.register(fastifyProxy, {
   rewritePrefix: "/ws",
   websocket: true,
   disableRequestLogging: true,
+  wsClientOptions: {
+    // O rewrite padrao do @fastify/http-proxy repassa so o cookie. Sem o Origin,
+    // a checagem de origem em lib/sockets.ts nunca enxerga a origem real do
+    // navegador e qualquer pagina conseguiria abrir um socket autenticado da
+    // vitima (cross-site WebSocket hijacking).
+    rewriteRequestHeaders: (headers, request) => ({
+      ...headers,
+      ...(request.headers.cookie ? { cookie: request.headers.cookie } : {}),
+      ...(request.headers.origin ? { origin: request.headers.origin } : {}),
+    }),
+  },
 });
 
 app.register(fastifySecureSession, {

@@ -83,12 +83,51 @@ const track = async (ws, token) => {
   ws.user = user;
 };
 
+// Origens autorizadas a abrir WebSocket. WS_ORIGINS (lista separada por virgula)
+// tem precedencia; sem ela, cai na URL do app. Hoje a UI e servida de
+// preview.satsroute.com enquanto o apex mostra a pagina de pre-lancamento, por
+// isso a lista precisa ser explicita e nao derivada so de URL.
+const wsOrigins = (process.env.WS_ORIGINS || process.env.URL || "")
+  .split(",")
+  .map((o) => o.trim().replace(/\/$/, ""))
+  .filter(Boolean);
+
+// Cross-site WebSocket hijacking: o handshake de WebSocket nao passa por CORS, e
+// o navegador manda os cookies. Sem conferir a origem, qualquer pagina poderia
+// abrir um socket autenticado da vitima e receber saldo e notificacoes de
+// pagamento. Requisicao sem Origin nao vem de navegador (cliente nativo, script)
+// e segue pelo caminho normal: quem nao e navegador nao tem o cookie da vitima.
+const originOk = (origin: string | null) => {
+  if (!origin) return true;
+  return wsOrigins.includes(origin.replace(/\/$/, ""));
+};
+
+const tokenFromCookie = (cookie: string | null) => {
+  if (!cookie) return null;
+  for (const part of cookie.split(";")) {
+    const [name, ...rest] = part.trim().split("=");
+    if (name === "token") return decodeURIComponent(rest.join("="));
+  }
+  return null;
+};
+
 Bun.serve({
   hostname: "0.0.0.0",
   port: 3120,
   fetch(req, server) {
+    const origin = req.headers.get("origin");
+    if (!originOk(origin)) {
+      warn("websocket rejeitado por origem", origin);
+      return new Response("Forbidden", { status: 403 });
+    }
+
+    // Autentica pelo cookie httpOnly: assim o token de sessao nao precisa ser
+    // entregue ao JavaScript da pagina. O caminho antigo (mensagem "login" com
+    // o token) continua funcionando para clientes que ainda o usem.
+    const token = tokenFromCookie(req.headers.get("cookie"));
+
     // upgrade the request to a WebSocket
-    if (server.upgrade(req)) {
+    if (server.upgrade(req, { data: { token } })) {
       return; // do not return a Response
     }
     return new Response("Upgrade failed", { status: 500 });
@@ -144,12 +183,25 @@ Bun.serve({
           // warn("received socket message of unknown type", type, data);
       }
     },
-    open(ws: any) {
+    async open(ws: any) {
       const id = v4();
       ws.id = id;
       ws.beats = 0;
       ws.send(JSON.stringify({ type: "connected", data: id }));
       all[id] = ws;
+
+      // Token vindo do cookie httpOnly no handshake. Falha aqui nao derruba a
+      // conexao: o socket segue anonimo, como sempre foi para quem nao esta
+      // logado, e o cliente antigo ainda pode se autenticar pela mensagem
+      // "login".
+      const token = ws.data?.token;
+      if (token) {
+        try {
+          await track(ws, token);
+        } catch (e) {
+          warn("websocket: cookie nao autenticou", (e as Error).message);
+        }
+      }
     },
     close(ws: any) {
       const { id } = ws;
