@@ -858,7 +858,16 @@ export default {
     const {
       body: { username, topic },
     } = req;
-    if (username === topic) res.send({ ok: true });
+    // Antes bastava POST com corpo vazio: username e topic vinham undefined,
+    // undefined === undefined e a resposta era {ok:true}. Como este hook e o
+    // backend de autorizacao do broker MQTT, isso autorizava qualquer topico.
+    if (
+      typeof username === "string" &&
+      typeof topic === "string" &&
+      username.length > 0 &&
+      username === topic
+    )
+      res.send({ ok: true });
     else bail(res, "unauthorized");
   },
 
@@ -866,7 +875,10 @@ export default {
     const {
       body: { username },
     } = req;
-    if (username === config.mqtt2.username) res.send({ ok: true });
+    // Exige os dois lados definidos: sem isso, corpo vazio contra config
+    // ausente compara undefined com undefined e autoriza.
+    const expected = config.mqtt2?.username;
+    if (expected && username && username === expected) res.send({ ok: true });
     else bail(res, "unauthorized");
   },
 
