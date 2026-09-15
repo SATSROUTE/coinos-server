@@ -59,8 +59,11 @@ export default {
   // Estes dependem de quanto voce quer que um usuario movimente. 0 = desligado.
   // DEFINIR ANTES DE ABRIR AO PUBLICO: um teto errado bloqueia cliente
   // legitimo, e nenhum teto deixa uma conta invadida drenar sem freio.
-  userLimitSats: 0,        // teto por pagamento, por usuario
-  dayLimitSats: 0,         // teto acumulado no dia, por usuario
+  // Valores em producao na SatsRoute desde 14/09/2026, deliberadamente
+  // conservadores: da para afrouxar com uso real, nao da para desfazer um saque.
+  // Sobreponiveis por usuario (limit:<uid> / daylimit:<uid> no KeyDB).
+  userLimitSats: 250000,   // teto por pagamento, por usuario (~R$ 1.000 em 09/2026)
+  dayLimitSats: 500000,    // teto acumulado no dia, por usuario (~R$ 2.000)
   tokenTtl: "30d",
   // Reconciliacao ledger x nos (lib/reconcile.ts). Intervalo em segundos;
   // limiares de deficit em sats. Acima de reconcileLockSats o job aciona
